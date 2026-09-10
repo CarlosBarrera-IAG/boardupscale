@@ -17,6 +17,7 @@ import { WebhooksModule } from '../webhooks/webhooks.module';
 import { AutomationModule } from '../automation/automation.module';
 import { ActivityModule } from '../activity/activity.module';
 import { AiModule } from '../ai/ai.module';
+import { CommentsModule } from '../comments/comments.module';
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { AiModule } from '../ai/ai.module';
     forwardRef(() => AutomationModule),
     ActivityModule,
     AiModule,
+    CommentsModule,
   ],
   controllers: [IssuesController],
   providers: [IssuesService],

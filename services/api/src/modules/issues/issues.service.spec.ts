@@ -19,6 +19,8 @@ import { UsersService } from '../users/users.service';
 import { EventsGateway } from '../../websocket/events.gateway';
 import { WebhookEventEmitter } from '../webhooks/webhook-event-emitter.service';
 import { AutomationEngineService } from '../automation/automation-engine.service';
+import { CommentsService } from '../comments/comments.service';
+import { ORIGINAL_DESCRIPTION_PRESERVED_MARKER } from './original-description-archive';
 import {
   createMockRepository,
   createMockQueryBuilder,
@@ -45,6 +47,7 @@ describe('IssuesService', () => {
   let permissionsService: Record<string, jest.Mock>;
   let emailService: Record<string, jest.Mock>;
   let usersService: Record<string, jest.Mock>;
+  let commentsService: { create: jest.Mock };
 
   beforeEach(async () => {
     issueRepo = createMockRepository();
@@ -73,6 +76,9 @@ describe('IssuesService', () => {
       findByOrg: jest.fn().mockResolvedValue([]),
       create: jest.fn(),
     };
+    commentsService = {
+      create: jest.fn().mockResolvedValue({ id: 'comment-1' }),
+    };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -95,6 +101,7 @@ describe('IssuesService', () => {
         { provide: ActivityService, useValue: { log: jest.fn().mockResolvedValue(undefined), findByIssue: jest.fn().mockResolvedValue({ data: [], total: 0 }) } },
         { provide: AuditService, useValue: { log: jest.fn().mockResolvedValue(undefined) } },
         { provide: PermissionsService, useValue: permissionsService },
+        { provide: CommentsService, useValue: commentsService },
       ],
     }).compile();
 
@@ -607,6 +614,58 @@ describe('IssuesService', () => {
       const result = await service.update(TEST_IDS.ISSUE_ID, TEST_IDS.ORG_ID, { title: 'Updated Title' }, TEST_IDS.USER_ID);
 
       expect(eventsGateway.emitToOrg).toHaveBeenCalledWith(TEST_IDS.ORG_ID, 'issue:updated', expect.anything());
+    });
+
+    it('should archive the original description in a comment on the first description edit', async () => {
+      const issue = mockIssue({
+        description: '<p>Original body</p>',
+        lockedFields: [],
+      });
+      const updatedIssue = mockIssue({ description: '<p>Updated body</p>' });
+      issueRepo.findOne
+        .mockResolvedValueOnce(issue)
+        .mockResolvedValueOnce(updatedIssue);
+      issueRepo.save.mockResolvedValue(updatedIssue);
+      issueRepo.query.mockResolvedValue(undefined);
+
+      await service.update(
+        TEST_IDS.ISSUE_ID,
+        TEST_IDS.ORG_ID,
+        { description: '<p>Updated body</p>' },
+        TEST_IDS.USER_ID,
+      );
+
+      expect(commentsService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          issueId: TEST_IDS.ISSUE_ID,
+          content: expect.stringContaining('<p>Original body</p>'),
+        }),
+        TEST_IDS.USER_ID,
+        TEST_IDS.ORG_ID,
+      );
+      expect(issueRepo.query).toHaveBeenCalledWith(
+        expect.stringContaining('locked_fields'),
+        [[ORIGINAL_DESCRIPTION_PRESERVED_MARKER], TEST_IDS.ISSUE_ID],
+      );
+    });
+
+    it('should not archive when description was already preserved', async () => {
+      const issue = mockIssue({
+        description: '<p>Original</p>',
+        lockedFields: [ORIGINAL_DESCRIPTION_PRESERVED_MARKER],
+      });
+      const updatedIssue = mockIssue({ description: '<p>Second edit</p>' });
+      issueRepo.findOne.mockResolvedValueOnce(issue).mockResolvedValueOnce(updatedIssue);
+      issueRepo.save.mockResolvedValue(updatedIssue);
+
+      await service.update(
+        TEST_IDS.ISSUE_ID,
+        TEST_IDS.ORG_ID,
+        { description: '<p>Second edit</p>' },
+        TEST_IDS.USER_ID,
+      );
+
+      expect(commentsService.create).not.toHaveBeenCalled();
     });
 
     it('should send notification when assignee changes to a different user', async () => {

@@ -46,6 +46,12 @@ import {
   SPRINT_INELIGIBLE_ISSUE_TYPES,
 } from "../../common/constants/sprint-planning-issue-types";
 import { resolveCreatedAtRangeBounds } from "../../common/utils/created-at-range";
+import { CommentsService } from "../comments/comments.service";
+import {
+  ORIGINAL_DESCRIPTION_PRESERVED_MARKER,
+  buildOriginalDescriptionArchiveComment,
+  shouldArchiveOriginalDescription,
+} from "./original-description-archive";
 
 @Injectable()
 export class IssuesService {
@@ -75,6 +81,7 @@ export class IssuesService {
     private activityService: ActivityService,
     private auditService: AuditService,
     private permissionsService: PermissionsService,
+    private commentsService: CommentsService,
     @Optional()
     @Inject(AutomationEngineService)
     private automationEngine?: AutomationEngineService,
@@ -567,6 +574,7 @@ export class IssuesService {
     const prevAssigneeId = issue.assigneeId;
     const prevStatusId = issue.statusId;
     const prevPriority = issue.priority;
+    const prevLockedFields = issue.lockedFields ?? [];
 
     // Capture previous values for activity logging
     const prevValues: Record<string, any> = {
@@ -652,6 +660,33 @@ export class IssuesService {
     if ("parentId" in cleanedDto) issue.parent = null;
 
     await this.issueRepository.save(issue);
+
+    if (
+      shouldArchiveOriginalDescription(
+        prevValues.description,
+        cleanedDto.description,
+        prevLockedFields,
+      )
+    ) {
+      await this.commentsService.create(
+        {
+          issueId: issue.id,
+          content: buildOriginalDescriptionArchiveComment(
+            prevValues.description as string,
+          ),
+        },
+        userId,
+        organizationId,
+      );
+      await this.issueRepository.query(
+        `UPDATE issues
+            SET locked_fields = ARRAY(
+              SELECT DISTINCT unnest(locked_fields || $1::text[])
+            )
+          WHERE id = $2`,
+        [[ORIGINAL_DESCRIPTION_PRESERVED_MARKER], issue.id],
+      );
+    }
 
     // Track manually-edited fields so the Jira migration worker does not
     // overwrite them during re-migration (locked_fields CASE WHEN pattern).
