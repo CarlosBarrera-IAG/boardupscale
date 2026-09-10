@@ -177,6 +177,30 @@ export class JiraConnectionService {
   }
 
   /**
+   * Create a Jira issue, assign it to the API token user, and move it to In Progress.
+   */
+  async createIssueInProgressForTokenUser(
+    connectionId: string,
+    organizationId: string,
+    input: {
+      projectKey: string;
+      summary: string;
+      description?: string;
+      issueTypeName?: string;
+    },
+  ) {
+    const credentials = await this.getDecryptedCredentials(
+      connectionId,
+      organizationId,
+    );
+
+    return this.jiraApiService.createIssueInProgressForTokenUser(
+      credentials,
+      input,
+    );
+  }
+
+  /**
    * Delete the active Jira connection for an organisation.
    */
   async deleteConnection(

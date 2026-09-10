@@ -1,7 +1,12 @@
-import { Injectable, Logger, BadGatewayException } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import * as https from 'https';
 import * as http from 'http';
 import { URL } from 'url';
+import {
+  buildCreateIssuePayload,
+  pickInProgressTransition,
+  type CreateJiraIssueFieldsInput,
+} from './jira-api-write.helpers';
 
 export interface JiraApiCredentials {
   baseUrl: string; // e.g. https://acme.atlassian.net
@@ -86,7 +91,16 @@ export interface JiraTestResult {
   errorMessage?: string;
 }
 
+export interface JiraCreatedIssueResult {
+  id: string;
+  key: string;
+  self?: string;
+  assigneeAccountId: string;
+  transitionedToInProgress: boolean;
+}
+
 const REQUEST_DELAY_MS = 100; // courtesy delay between paginated requests
+const IN_PROGRESS_STATUS_NAME = 'In Progress';
 
 /**
  * Thin HTTP client for the Jira REST API v3.
@@ -101,20 +115,23 @@ const REQUEST_DELAY_MS = 100; // courtesy delay between paginated requests
 export class JiraApiService {
   private readonly logger = new Logger(JiraApiService.name);
 
-  /**
-   * Make a GET request to the Jira REST API.
-   * Retries once on 429 (rate limit) with a 2-second back-off.
-   */
-  private async get<T>(
-    credentials: JiraApiCredentials,
-    path: string,
-    attempt = 1,
-  ): Promise<T> {
-    // OAuth connections have no email — use Bearer auth; API-token connections use Basic auth
-    const authHeader = credentials.email
+  private buildAuthHeader(credentials: JiraApiCredentials): string {
+    return credentials.email
       ? `Basic ${Buffer.from(`${credentials.email}:${credentials.apiToken}`).toString('base64')}`
       : `Bearer ${credentials.apiToken}`;
+  }
 
+  /**
+   * Low-level Jira REST call. Retries once on 429 (rate limit).
+   */
+  async request<T>(
+    credentials: JiraApiCredentials,
+    method: 'GET' | 'POST' | 'PUT',
+    path: string,
+    body?: unknown,
+    attempt = 1,
+  ): Promise<T> {
+    const authHeader = this.buildAuthHeader(credentials);
     const rawUrl = credentials.baseUrl.replace(/\/$/, '') + path;
     const parsedUrl = new URL(rawUrl);
     const isHttps = parsedUrl.protocol === 'https:';
@@ -125,27 +142,30 @@ export class JiraApiService {
         ? 443
         : 80;
 
+    const payload =
+      body === undefined ? undefined : JSON.stringify(body);
+
     const options: http.RequestOptions = {
       hostname: parsedUrl.hostname,
       port,
       path: parsedUrl.pathname + parsedUrl.search,
-      method: 'GET',
+      method,
       headers: {
         Authorization: authHeader,
         Accept: 'application/json',
         'Content-Type': 'application/json',
+        ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
       },
     };
 
     return new Promise((resolve, reject) => {
       const req = transport.request(options, (res) => {
-        let body = '';
-        res.on('data', (chunk: Buffer) => (body += chunk.toString()));
+        let responseBody = '';
+        res.on('data', (chunk: Buffer) => (responseBody += chunk.toString()));
         res.on('end', () => {
           if (res.statusCode === 429 && attempt === 1) {
-            // Rate limited — back off and retry once
             setTimeout(() => {
-              this.get<T>(credentials, path, 2)
+              this.request<T>(credentials, method, path, body, 2)
                 .then(resolve)
                 .catch(reject);
             }, 2000);
@@ -155,16 +175,25 @@ export class JiraApiService {
           if (res.statusCode && res.statusCode >= 400) {
             reject(
               new Error(
-                `Jira API ${res.statusCode}: ${body.slice(0, 200)}`,
+                `Jira API ${res.statusCode}: ${responseBody.slice(0, 200)}`,
               ),
             );
             return;
           }
 
+          if (!responseBody.trim()) {
+            resolve(undefined as T);
+            return;
+          }
+
           try {
-            resolve(JSON.parse(body) as T);
+            resolve(JSON.parse(responseBody) as T);
           } catch {
-            reject(new Error(`Jira API returned non-JSON: ${body.slice(0, 200)}`));
+            reject(
+              new Error(
+                `Jira API returned non-JSON: ${responseBody.slice(0, 200)}`,
+              ),
+            );
           }
         });
       });
@@ -174,13 +203,81 @@ export class JiraApiService {
         req.destroy();
         reject(new Error('Jira API request timed out (15s)'));
       });
+      if (payload) req.write(payload);
       req.end();
     });
+  }
+
+  private get<T>(
+    credentials: JiraApiCredentials,
+    path: string,
+    attempt = 1,
+  ): Promise<T> {
+    return this.request<T>(credentials, 'GET', path, undefined, attempt);
   }
 
   /**
    * Verify credentials and return the authenticated user's display name.
    */
+  async getMyself(
+    credentials: JiraApiCredentials,
+  ): Promise<{ accountId: string; displayName?: string }> {
+    const result = await this.get<{ accountId: string; displayName?: string }>(
+      credentials,
+      '/rest/api/3/myself',
+    );
+    if (!result.accountId) {
+      throw new Error('Jira /myself did not return accountId');
+    }
+    return result;
+  }
+
+  async createIssueInProgressForTokenUser(
+    credentials: JiraApiCredentials,
+    input: CreateJiraIssueFieldsInput,
+  ): Promise<JiraCreatedIssueResult> {
+    const myself = await this.getMyself(credentials);
+    const created = await this.request<{ id: string; key: string; self?: string }>(
+      credentials,
+      'POST',
+      '/rest/api/3/issue',
+      buildCreateIssuePayload(input),
+    );
+
+    await this.request(
+      credentials,
+      'PUT',
+      `/rest/api/3/issue/${encodeURIComponent(created.key)}/assignee`,
+      { accountId: myself.accountId },
+    );
+
+    const transitions = await this.get<{ transitions: Array<{ id: string; name?: string; to?: { name?: string } }> }>(
+      credentials,
+      `/rest/api/3/issue/${encodeURIComponent(created.key)}/transitions`,
+    );
+    const inProgress = pickInProgressTransition(transitions.transitions ?? []);
+    if (inProgress) {
+      await this.request(
+        credentials,
+        'POST',
+        `/rest/api/3/issue/${encodeURIComponent(created.key)}/transitions`,
+        { transition: { id: inProgress.id } },
+      );
+    } else {
+      this.logger.warn(
+        `No "${IN_PROGRESS_STATUS_NAME}" transition for ${created.key}; issue left in default workflow state`,
+      );
+    }
+
+    return {
+      id: created.id,
+      key: created.key,
+      self: created.self,
+      assigneeAccountId: myself.accountId,
+      transitionedToInProgress: Boolean(inProgress),
+    };
+  }
+
   async testConnection(
     credentials: JiraApiCredentials,
   ): Promise<JiraTestResult> {

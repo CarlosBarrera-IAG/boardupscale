@@ -29,6 +29,7 @@ import {
   TestJiraConnectionDto,
   StartApiImportDto,
 } from './dto/jira-connection.dto';
+import { CreateJiraIssueDto } from './dto/create-jira-issue.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { RequirePermission } from '../../common/decorators/require-permission.decorator';
@@ -205,6 +206,25 @@ export class ImportController {
       organizationId,
     );
     return { data: projects };
+  }
+
+  @Post('jira/connection/:connectionId/issues')
+  @ApiOperation({
+    summary:
+      'Create a Jira issue, assign to the connection token user, and transition to In Progress',
+  })
+  @ApiResponse({ status: 201, description: 'Jira issue created' })
+  async createJiraIssue(
+    @Param('connectionId') connectionId: string,
+    @Body() dto: CreateJiraIssueDto,
+    @OrgId() organizationId: string,
+  ) {
+    const issue = await this.jiraConnectionService.createIssueInProgressForTokenUser(
+      connectionId,
+      organizationId,
+      dto,
+    );
+    return { data: issue };
   }
 
   @Delete('jira/connection/:connectionId')
